@@ -57,6 +57,15 @@ Health check: `GET /api/health` returns `{ "status": "ok" }` (no auth needed).
 
   So a $4.50 coffee is `4.5` and a $1,500 paycheck is `-1500`. Show the sign the way your UI needs; the summary endpoints already return income as a positive number.
 - **Error shape:** always `{ "error": "message" }` with an appropriate status code. See [Errors](#errors).
+- **Rate limits:** three tiers, all returning `429 { "error": "message" }` when exceeded.
+  | Tier | Limit | Applies to |
+  |---|---|---|
+  | Auth | 20 / 15 min per IP | `POST /api/auth/register`, `POST /api/auth/login` |
+  | General | 300 / 15 min per user (per IP if unauthenticated) | every other `/api` route |
+  | Bank sync | 10 / 15 min per user | `POST /api/plaid/sync-transactions`, `POST /api/plaid/refresh-balances` |
+  | Link token | 30 / 15 min per user | `POST /api/plaid/create-link-token` |
+
+  300/15 min is far above normal dashboard usage — it's there to catch a runaway request loop, not to constrain a real user. If you get a `429`, back off and show a "try again in a few minutes" message rather than retrying immediately.
 
 ---
 
@@ -112,6 +121,30 @@ Body: `{ "email": "ada@example.com", "password": "secret123" }`
 
 `200`: same shape as register (`token` + `user`). Error: `401 { "error": "Invalid credentials" }` for a wrong email or password (the message is deliberately the same for both).
 
+### PUT `/api/auth/me`
+
+Updates the display name. Email isn't editable through this endpoint.
+
+Body: `{ "name": "New Name" }`
+
+`200`: `{ "user": { ... } }`. Error: `400` if `name` is missing or empty.
+
+### PUT `/api/auth/me/password`
+
+Changes the password. Requires the current password.
+
+Body: `{ "currentPassword": "...", "newPassword": "..." }`
+
+`200`: `{ "message": "Password updated" }`. Errors: `400` missing fields or `newPassword` under 8 characters, `401` if `currentPassword` is wrong.
+
+### DELETE `/api/auth/me`
+
+Permanently deletes the account: every linked bank (removed at Plaid first, same as `DELETE /api/plaid/items/:itemId`), their accounts and transactions, and all budgets. **No undo.** Requires the current password as confirmation — the frontend should also confirm with the user before calling this.
+
+Body: `{ "password": "..." }`
+
+`200`: `{ "message": "Account and all associated data deleted" }`. Errors: `400` missing password, `401` wrong password, `502` if a linked bank couldn't be removed at Plaid (nothing is deleted locally in that case — retry is safe).
+
 ### GET `/api/auth/me`
 
 `200`:
@@ -137,9 +170,17 @@ The password and Plaid access tokens are never returned. Use this to check on pa
 
 ### POST `/api/plaid/create-link-token`
 
-No body. `200`: `{ "link_token": "link-sandbox-..." }`. Pass this to Plaid Link to open the bank-connection popup.
+Body optional. `200`: `{ "link_token": "link-sandbox-..." }`. Pass this to Plaid Link to open the bank-connection popup.
 
-Error: `500 { "error": "Failed to create link token" }`.
+To **reconnect** a bank that `refresh-balances` reported as `ITEM_LOGIN_REQUIRED`, pass that bank's `itemId` instead of linking it fresh:
+
+```json
+{ "itemId": "abc123" }
+```
+
+This opens Plaid Link in *update mode* against the existing connection rather than creating a new one — the reconnect doesn't produce duplicate accounts or transactions the way linking again from scratch would. No `exchange-public-token` call is needed afterward; update mode re-authorizes the existing access token in place.
+
+Errors: `404 { "error": "Linked bank not found" }` if `itemId` isn't one of the user's banks, `500` if Plaid rejects the request.
 
 ### POST `/api/plaid/exchange-public-token`
 
@@ -161,7 +202,15 @@ The backend exchanges the token, stores the credentials server-side, and saves t
 
 ### POST `/api/plaid/sync-transactions`
 
-No body. Fetches the last 30 days of transactions from every linked bank (all pages, so busy accounts aren't truncated) and saves them. Safe to call repeatedly (existing transactions are updated, not duplicated).
+Body optional. Fetches transactions from every linked bank (all pages, so busy accounts aren't truncated) and saves them. Safe to call repeatedly (existing transactions are updated, not duplicated).
+
+By default this covers the last 30 days. Pass `days` to widen the window (e.g. a first sync, or catching up after time away):
+
+```json
+{ "days": 90 }
+```
+
+`days` must be an integer between 1 and 730.
 
 `200`: `{ "message": "Synced 42 transactions", "skippedEdited": 1 }`
 
@@ -175,6 +224,8 @@ Errors: `400 { "error": "No linked bank accounts" }`, `500` if Plaid fails. Call
 
 No body. Re-reads the balances of every linked bank from Plaid and updates the saved accounts. Use it for a "Refresh balances" button.
 
+By default this reads Plaid's cached balances (which Plaid refreshes periodically on its own), not a live check with the bank. Add `?live=true` to instead call Plaid's real-time balance endpoint. **Plaid bills the live endpoint per call in production** — use it for an explicit "get exact balance now" action, not on every page load.
+
 `200`:
 
 ```json
@@ -184,6 +235,7 @@ No body. Re-reads the balances of every linked bank from Plaid and updates the s
   "failed": [
     { "itemId": "abc123", "institutionName": "Chase", "error": "ITEM_LOGIN_REQUIRED" }
   ],
+  "live": false,
   "accounts": [ /* ALL of the user's accounts, with fresh balances where the refresh worked */ ]
 }
 ```
@@ -195,13 +247,41 @@ No body. Re-reads the balances of every linked bank from Plaid and updates the s
 
 Errors: `400 { "error": "No linked bank accounts" }`. If **every** linked bank fails, the status is `500` with `{ "error": "Failed to refresh balances", "failed": [ ... ] }`.
 
-These are Plaid's cached balances, which Plaid refreshes periodically, so this re-reads what Plaid has and is not a live check with the bank.
+### DELETE `/api/plaid/items/:itemId`
+
+Unlinks one bank. **This permanently deletes that bank's accounts and every transaction on them — including ones the user edited or added by hand — with no undo.** Confirm with the user before calling this, and say so plainly in the confirmation, e.g. "This removes First Platypus Bank and deletes all of its transaction history, including any you edited. This can't be undone."
+
+No body. `200`:
+
+```json
+{ "message": "Bank disconnected", "itemId": "abc123", "accountsRemoved": 2 }
+```
+
+The bank is removed at Plaid first; if that fails (for any reason other than the item already being gone at Plaid's end), nothing local is deleted and the response is `502 { "error": "...", "plaidError": "..." }` — retry is safe.
+
+To reconnect a bank that failed rather than unlinking it, use `create-link-token` with `itemId` (update mode) instead of this endpoint.
+
+Errors: `404` if `itemId` isn't one of the user's banks, `502` if Plaid can't be reached.
 
 ## Transactions
 
 ### GET `/api/transactions`
 
-`200`: `{ "transactions": [ /* Transaction objects */ ] }` — newest first, capped at the latest 200. No filters or pagination yet (see [Known limitations](#known-limitations)).
+`200`: `{ "transactions": [ /* Transaction objects */ ], "page": 1, "limit": 200 }` — newest first.
+
+All query parameters are optional; with none of them this is unchanged from before (most recent 200 transactions).
+
+| Param | Notes |
+|---|---|
+| `account` | Filter to one account's `_id` |
+| `category` | Exact match, case-insensitive |
+| `from`, `to` | Date range, inclusive on both ends. Either can be given alone |
+| `limit` | Default `200`, max `500` |
+| `page` | 1-based, default `1` |
+
+Example: `GET /api/transactions?category=Food and Drink&from=2026-08-01&to=2026-08-31&limit=50&page=2`
+
+Errors: `400` for an invalid `account` id, an unparseable `from`/`to`, a `limit` outside 1–500, or a non-positive `page`.
 
 ### POST `/api/transactions`
 
@@ -293,6 +373,12 @@ Body: `{ "category": "Food and Drink", "monthlyLimit": 300 }`
 
 `200`: `{ "budget": { ... } }`. Error: `400` if either field is missing.
 
+### DELETE `/api/budgets/:id`
+
+Removes a category's limit. Does not touch the transactions themselves, only the limit tracked against them.
+
+`200`: `{ "message": "Budget deleted", "budget": { ... } }`. Errors: `400` invalid id, `404` not found.
+
 ### GET `/api/budgets/status`
 
 Each budget alongside spending in the **current calendar month** (expenses only). This is what a budget progress bar needs.
@@ -364,7 +450,9 @@ Each budget alongside spending in the **current calendar month** (expenses only)
 | `401` | No token, or the token is invalid or expired. Clear the stored token and go to login |
 | `404` | Resource not found (or not yours), or unknown route |
 | `409` | Conflict, e.g. email already registered |
-| `500` | Server or Plaid failure |
+| `429` | Rate limit exceeded — see [Conventions](#conventions) |
+| `500` | Server failure |
+| `502` | Plaid couldn't be reached to remove a linked bank — nothing local was changed |
 
 Auth errors use these messages: `"No token provided"` and `"Invalid or expired token"`.
 
@@ -381,6 +469,8 @@ Use the [`react-plaid-link`](https://github.com/plaid/react-plaid-link) package.
 5. Reload `GET /api/plaid/accounts` and `GET /api/transactions` to update the screen.
 
 In the Plaid sandbox, pick any test bank and log in with username `user_good` and password `pass_good`.
+
+**Reconnecting a bank that failed:** when `refresh-balances` reports `ITEM_LOGIN_REQUIRED` for a bank, call `create-link-token` with that bank's `itemId` to get an update-mode token, then open Plaid Link with it as usual. On success, call `sync-transactions` and reload accounts — no `exchange-public-token` call needed, since update mode re-authorizes the existing connection rather than creating a new one.
 
 ---
 

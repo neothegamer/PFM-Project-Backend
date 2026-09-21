@@ -2,6 +2,7 @@ const express = require("express");
 const plaidClient = require("../config/plaid");
 const requireAuth = require("../middleware/auth");
 const asyncHandler = require("../middleware/asyncHandler");
+const { plaidActionLimiter, linkTokenLimiter } = require("../middleware/rateLimit");
 const User = require("../models/User");
 const Account = require("../models/Account");
 const Transaction = require("../models/Transaction");
@@ -10,19 +11,35 @@ const { encryptToken, decryptToken } = require("../utils/crypto");
 const { fetchAllTransactions } = require("../utils/plaidTransactions");
 const { getInstitutionName, isPlaceholderBankName, FALLBACK_BANK_NAME } = require("../utils/plaidInstitution");
 const { saveAccounts } = require("../utils/accounts");
+const { removeItemAtPlaid } = require("../utils/plaidUnlink");
 
 const router = express.Router();
 
 // POST /api/plaid/create-link-token
-router.post("/create-link-token", requireAuth, async (req, res) => {
+// Body may include { itemId } to get a token for Plaid Link's *update* mode —
+// used to reconnect a bank that failed with ITEM_LOGIN_REQUIRED, instead of
+// linking it again as a brand-new connection.
+router.post("/create-link-token", requireAuth, linkTokenLimiter, async (req, res) => {
   try {
-    const response = await plaidClient.linkTokenCreate({
+    const { itemId } = req.body;
+    const params = {
       user: { client_user_id: req.userId.toString() },
       client_name: "PFM Dashboard",
-      products: ["transactions"],
       country_codes: ["US"],
       language: "en",
-    });
+    };
+
+    if (itemId) {
+      const user = await User.findById(req.userId).select("plaidItems");
+      const item = user?.plaidItems.find((i) => i.itemId === itemId);
+      if (!item) return res.status(404).json({ error: "Linked bank not found" });
+      // Update mode: pass the existing access_token instead of `products`.
+      params.access_token = decryptToken(item.accessToken);
+    } else {
+      params.products = ["transactions"];
+    }
+
+    const response = await plaidClient.linkTokenCreate(params);
     res.json({ link_token: response.data.link_token });
   } catch (err) {
     console.error(err.response?.data || err.message);
@@ -74,17 +91,32 @@ router.get("/accounts", requireAuth, asyncHandler(async (req, res) => {
   res.json({ accounts });
 }));
 
+// Plaid's sandbox and most production data providers only guarantee history
+// back to roughly two years; this is a sanity cap, not a Plaid-enforced one.
+const MAX_SYNC_DAYS = 730;
+const DEFAULT_SYNC_DAYS = 30;
+
 // POST /api/plaid/sync-transactions
-router.post("/sync-transactions", requireAuth, async (req, res) => {
+// Body may include { days } to widen the sync window beyond the default 30
+// (e.g. a first sync, or catching up after not opening the app for a while).
+router.post("/sync-transactions", requireAuth, plaidActionLimiter, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
     if (!user.plaidItems.length) {
       return res.status(400).json({ error: "No linked bank accounts" });
     }
 
+    let days = DEFAULT_SYNC_DAYS;
+    if (req.body?.days !== undefined) {
+      days = Number(req.body.days);
+      if (!Number.isInteger(days) || days < 1 || days > MAX_SYNC_DAYS) {
+        return res.status(400).json({ error: `days must be an integer between 1 and ${MAX_SYNC_DAYS}` });
+      }
+    }
+
     let totalSynced = 0;
     let skippedEdited = 0;
-    const startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const endDate = new Date().toISOString().slice(0, 10);
 
     const accounts = await Account.find({ user: req.userId });
@@ -141,20 +173,27 @@ router.post("/sync-transactions", requireAuth, async (req, res) => {
 // user must reconnect it) it is listed in `failed` and the others still refresh. Only if EVERY
 // linked bank fails does this return 500. Also replaces a placeholder bank name (an old
 // "ins_..." id or "Connected Bank") with the real name when it can.
-router.post("/refresh-balances", requireAuth, async (req, res) => {
+// ?live=true swaps the cached read for /accounts/balance/get, a real-time
+// check with the bank. Plaid bills this endpoint per call in production, so
+// it's opt-in rather than the default — same tradeoff noted in the comment
+// above.
+router.post("/refresh-balances", requireAuth, plaidActionLimiter, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
     if (!user?.plaidItems?.length) {
       return res.status(400).json({ error: "No linked bank accounts" });
     }
 
+    const live = req.query.live === "true";
     let refreshed = 0;
     const failed = [];
 
     for (const item of user.plaidItems) {
       try {
         const accessToken = decryptToken(item.accessToken);
-        const response = await plaidClient.accountsGet({ access_token: accessToken });
+        const response = live
+          ? await plaidClient.accountsBalanceGet({ access_token: accessToken })
+          : await plaidClient.accountsGet({ access_token: accessToken });
 
         let institutionName = item.institutionName;
         if (isPlaceholderBankName(institutionName)) {
@@ -194,11 +233,45 @@ router.post("/refresh-balances", requireAuth, async (req, res) => {
 
     // Return every account (not just the refreshed ones) so the frontend can replace its list.
     const accounts = await Account.find({ user: req.userId });
-    res.json({ message: `Refreshed balances for ${refreshed} account(s)`, refreshed, failed, accounts });
+    res.json({ message: `Refreshed balances for ${refreshed} account(s)`, refreshed, failed, live, accounts });
   } catch (err) {
     console.error(err.response?.data || err.message);
     res.status(500).json({ error: "Failed to refresh balances" });
   }
 });
+
+// DELETE /api/plaid/items/:itemId — unlink one bank. Removes the item at
+// Plaid first (an already-removed item is treated as success — see
+// removeItemAtPlaid), and only then deletes its accounts and their
+// transactions locally, and drops the item from the user's plaidItems. If
+// Plaid can't be reached or refuses for any other reason, nothing local is
+// touched, so there's never an active Plaid connection with no local record.
+//
+// This deletes that bank's transaction history, including any the user
+// edited or added by hand on its accounts — irreversible, so the frontend
+// should confirm with the user and say so before calling this.
+router.delete("/items/:itemId", requireAuth, asyncHandler(async (req, res) => {
+  const { itemId } = req.params;
+  const user = await User.findById(req.userId).select("plaidItems");
+  const item = user?.plaidItems.find((i) => i.itemId === itemId);
+  if (!item) return res.status(404).json({ error: "Linked bank not found" });
+
+  const result = await removeItemAtPlaid(plaidClient, decryptToken(item.accessToken));
+  if (!result.ok) {
+    return res.status(502).json({
+      error: "Could not disconnect this bank. Please try again.",
+      plaidError: result.errorCode,
+    });
+  }
+
+  const accounts = await Account.find({ user: req.userId, itemId }).select("_id");
+  const accountIds = accounts.map((a) => a._id);
+
+  await Transaction.deleteMany({ user: req.userId, account: { $in: accountIds } });
+  await Account.deleteMany({ user: req.userId, itemId });
+  await User.updateOne({ _id: req.userId }, { $pull: { plaidItems: { itemId } } });
+
+  res.json({ message: "Bank disconnected", itemId, accountsRemoved: accountIds.length });
+}));
 
 module.exports = router;

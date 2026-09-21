@@ -1,4 +1,5 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const requireAuth = require("../middleware/auth");
 const asyncHandler = require("../middleware/asyncHandler");
 const Budget = require("../models/Budget");
@@ -28,6 +29,17 @@ router.put("/", requireAuth, asyncHandler(async (req, res) => {
     { upsert: true, new: true }
   );
   res.json({ budget });
+}));
+
+// DELETE /api/budgets/:id — remove a category's monthly limit. Does not touch
+// the transactions themselves, only the limit tracked against them.
+router.delete("/:id", requireAuth, asyncHandler(async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ error: "Invalid budget id" });
+  }
+  const budget = await Budget.findOneAndDelete({ _id: req.params.id, user: req.userId });
+  if (!budget) return res.status(404).json({ error: "Budget not found" });
+  res.json({ message: "Budget deleted", budget });
 }));
 
 // GET /api/budgets/status — each budget alongside this month's actual spend

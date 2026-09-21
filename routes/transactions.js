@@ -12,13 +12,74 @@ const router = express.Router();
 // plaidTransactionId, isManual, ...) is server-controlled.
 const EDITABLE_FIELDS = ["name", "amount", "date", "category"];
 
-// GET /api/transactions — plain list, this is your "bare-bones frontend" data source (step 3)
+// Highest a caller can ask for via ?limit=; keeps a mistaken ?limit=100000
+// from turning into an unbounded query.
+const MAX_TRANSACTIONS_LIMIT = 500;
+const DEFAULT_TRANSACTIONS_LIMIT = 200;
+
+// GET /api/transactions — filterable, paginated list. All query params are
+// optional; with none of them this behaves exactly as before (most recent
+// 200), so existing frontend calls don't change behavior.
+//   ?account=<id>       only this account
+//   ?category=<name>    exact match, case-insensitive
+//   ?from=&to=           inclusive date range (either end optional)
+//   ?limit=<n>            default 200, capped at 500
+//   ?page=<n>             1-based, default 1
 router.get(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const transactions = await Transaction.find({ user: req.userId }).sort({ date: -1 }).limit(200);
-    res.json({ transactions });
+    const { account, category, from, to } = req.query;
+    const query = { user: req.userId };
+
+    if (account !== undefined) {
+      if (!mongoose.isValidObjectId(account)) {
+        return res.status(400).json({ error: "Invalid account id" });
+      }
+      query.account = account;
+    }
+
+    if (category !== undefined) {
+      // Exact match but case-insensitive, since categories are free text
+      // (user-typed on manual entries) rather than a fixed enum.
+      query.category = new RegExp(`^${category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+    }
+
+    if (from !== undefined || to !== undefined) {
+      query.date = {};
+      if (from !== undefined) {
+        const fromDate = new Date(from);
+        if (Number.isNaN(fromDate.getTime())) return res.status(400).json({ error: "Invalid 'from' date" });
+        query.date.$gte = fromDate;
+      }
+      if (to !== undefined) {
+        const toDate = new Date(to);
+        if (Number.isNaN(toDate.getTime())) return res.status(400).json({ error: "Invalid 'to' date" });
+        query.date.$lte = toDate;
+      }
+    }
+
+    let limit = DEFAULT_TRANSACTIONS_LIMIT;
+    if (req.query.limit !== undefined) {
+      limit = Number(req.query.limit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > MAX_TRANSACTIONS_LIMIT) {
+        return res.status(400).json({ error: `limit must be an integer between 1 and ${MAX_TRANSACTIONS_LIMIT}` });
+      }
+    }
+
+    let page = 1;
+    if (req.query.page !== undefined) {
+      page = Number(req.query.page);
+      if (!Number.isInteger(page) || page < 1) {
+        return res.status(400).json({ error: "page must be a positive integer" });
+      }
+    }
+
+    const transactions = await Transaction.find(query)
+      .sort({ date: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+    res.json({ transactions, page, limit });
   })
 );
 

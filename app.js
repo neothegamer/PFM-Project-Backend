@@ -7,6 +7,7 @@ const plaidRoutes = require("./routes/plaid");
 const transactionRoutes = require("./routes/transactions");
 const budgetRoutes = require("./routes/budgets");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
+const { generalLimiter } = require("./middleware/rateLimit");
 
 // CORS_ORIGIN is a comma-separated allowlist, e.g. "https://app.example.com,http://localhost:5173".
 // Falls back to common local dev ports so `npm run dev` keeps working out of the box;
@@ -42,6 +43,13 @@ function createApp() {
   app.use(express.json());
 
   app.get("/api/health", (req, res) => res.json({ status: "ok" }));
+
+  // Keyed by user (once a valid token is present) or by IP otherwise. Sits
+  // ahead of every route below, including auth's own tighter limiter on
+  // register/login, and ahead of requireAuth — see keyGenerator in
+  // middleware/rateLimit.js for how it reads the user id without a full
+  // auth check.
+  app.use("/api", generalLimiter);
 
   app.use("/api/auth", authRoutes);
   app.use("/api/plaid", plaidRoutes);

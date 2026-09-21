@@ -12,6 +12,16 @@ if (!process.env.JWT_SECRET) {
 // (or get broken by) whatever TOKEN_ENCRYPTION_KEY is in your real .env.
 process.env.TOKEN_ENCRYPTION_KEY = "a".repeat(64);
 
+// Rate limiters are module-level singletons, so their in-memory counters are
+// shared across every test file in this run (Jest runs them --runInBand in
+// one process). Off by default so an unrelated suite hammering an endpoint
+// dozens of times doesn't trip a limiter meant for real traffic. A suite that
+// specifically tests rate limiting flips this back on for itself — see
+// __tests__/rateLimit.test.js.
+if (process.env.RATE_LIMIT_ENABLED === undefined) {
+  process.env.RATE_LIMIT_ENABLED = "false";
+}
+
 let mongo;
 
 // A 30s timeout on just this hook — starting the in-memory MongoDB engine can
