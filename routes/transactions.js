@@ -5,6 +5,7 @@ const asyncHandler = require("../middleware/asyncHandler");
 const Transaction = require("../models/Transaction");
 const Account = require("../models/Account");
 const categorizeTransaction = require("../utils/categorize");
+const { adjustManualBalance } = require("../utils/manualAccounts");
 
 const router = express.Router();
 
@@ -119,6 +120,12 @@ router.post(
       notes: notes || "",
       isManual: true,
     });
+
+    // Manual accounts have no Plaid to re-read balances from — keep the
+    // stored balance in sync with what the user logs. Positive amount is
+    // money out, so the balance delta is `-amount`. No-op for linked accounts.
+    await adjustManualBalance(account, -Number(amount));
+
     res.status(201).json({ transaction: txn });
   })
 );
@@ -143,12 +150,24 @@ router.put(
     if (updates.category !== undefined) updates.category = String(updates.category).trim();
     updates.isEdited = true; // tells Plaid sync not to overwrite this later
 
-    const txn = await Transaction.findOneAndUpdate(
-      { _id: req.params.id, user: req.userId },
+    // Read first: doubles as the ownership/existence check AND gives us the
+    // old amount, which the manual-balance sync below needs for a diff.
+    const existing = await Transaction.findOne({ _id: req.params.id, user: req.userId });
+    if (!existing) return res.status(404).json({ error: "Transaction not found" });
+
+    const txn = await Transaction.findByIdAndUpdate(
+      req.params.id,
       { $set: updates },
       { new: true, runValidators: true }
     );
-    if (!txn) return res.status(404).json({ error: "Transaction not found" });
+
+    // If the amount changed, correct the manual account's balance by the
+    // difference. Balance delta is `-amount`, so old-minus-new; no-op for
+    // Plaid-linked accounts.
+    if (updates.amount !== undefined && Number(updates.amount) !== existing.amount) {
+      await adjustManualBalance(existing.account, existing.amount - Number(updates.amount));
+    }
+
     res.json({ transaction: txn });
   })
 );
@@ -163,6 +182,11 @@ router.delete(
     }
     const txn = await Transaction.findOneAndDelete({ _id: req.params.id, user: req.userId });
     if (!txn) return res.status(404).json({ error: "Transaction not found" });
+
+    // Reverse the balance effect on a manual account (delta = -amount, so
+    // deleting adds `amount` back). No-op for Plaid-linked accounts.
+    await adjustManualBalance(txn.account, Number(txn.amount));
+
     res.json({ message: "Transaction deleted", transaction: txn });
   })
 );

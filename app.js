@@ -6,6 +6,7 @@ const authRoutes = require("./routes/auth");
 const plaidRoutes = require("./routes/plaid");
 const transactionRoutes = require("./routes/transactions");
 const budgetRoutes = require("./routes/budgets");
+const accountRoutes = require("./routes/accounts");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 const { generalLimiter } = require("./middleware/rateLimit");
 
@@ -55,6 +56,7 @@ function createApp() {
   app.use("/api/plaid", plaidRoutes);
   app.use("/api/transactions", transactionRoutes);
   app.use("/api/budgets", budgetRoutes);
+  app.use("/api/accounts", accountRoutes);
 
   // Must come after all routes
   app.use(notFound);
