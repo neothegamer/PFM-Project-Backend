@@ -9,6 +9,7 @@ const transactionSchema = new mongoose.Schema(
     amount: { type: Number, required: true }, // positive = expense, negative = income (Plaid convention)
     date: { type: Date, required: true },
     category: { type: String, default: "Uncategorized" }, // filled in by categorization logic later
+    notes: { type: String, default: "" },
     isManual: { type: Boolean, default: false }, // true if created by the user directly
     isEdited: { type: Boolean, default: false }, // true once the user edits it; Plaid sync then leaves it alone
   },

@@ -10,7 +10,7 @@ const router = express.Router();
 
 // Only these fields may be changed through PUT. Everything else (user, account,
 // plaidTransactionId, isManual, ...) is server-controlled.
-const EDITABLE_FIELDS = ["name", "amount", "date", "category"];
+const EDITABLE_FIELDS = ["name", "amount", "date", "category", "notes"];
 
 // Highest a caller can ask for via ?limit=; keeps a mistaken ?limit=100000
 // from turning into an unbounded query.
@@ -88,12 +88,15 @@ router.post(
   "/",
   requireAuth,
   asyncHandler(async (req, res) => {
-    const { account, name, amount, date, category } = req.body;
+    const { account, name, amount, date, category, notes } = req.body;
     if (!account || !name || amount === undefined || !date) {
       return res.status(400).json({ error: "account, name, amount, and date are required" });
     }
     if (typeof name !== "string") {
       return res.status(400).json({ error: "name must be a string" });
+    }
+    if (notes !== undefined && typeof notes !== "string") {
+      return res.status(400).json({ error: "notes must be a string" });
     }
     if (!mongoose.isValidObjectId(account)) {
       return res.status(400).json({ error: "Invalid account id" });
@@ -112,14 +115,15 @@ router.post(
       date,
       // If the user didn't specify a category, try our own merchant-name rules
       // before falling back to "Uncategorized" — same logic used for synced transactions.
-      category: category || categorizeTransaction(name) || "Uncategorized",
+      category: (category || categorizeTransaction(name) || "Uncategorized").trim(),
+      notes: notes || "",
       isManual: true,
     });
     res.status(201).json({ transaction: txn });
   })
 );
 
-// PUT /api/transactions/:id — edit a transaction (name, amount, date, category)
+// PUT /api/transactions/:id — edit a transaction (name, amount, date, category, notes)
 router.put(
   "/:id",
   requireAuth,
@@ -136,6 +140,7 @@ router.put(
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ error: `Provide at least one of: ${EDITABLE_FIELDS.join(", ")}` });
     }
+    if (updates.category !== undefined) updates.category = String(updates.category).trim();
     updates.isEdited = true; // tells Plaid sync not to overwrite this later
 
     const txn = await Transaction.findOneAndUpdate(
